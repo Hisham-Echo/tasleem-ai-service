@@ -1,8 +1,7 @@
 fastapi
-uvicorn
+uvicorn[standard]
 pandas
 numpy
 faiss-cpu
-sentence-transformers
 scikit-learn
 google-generativeai
