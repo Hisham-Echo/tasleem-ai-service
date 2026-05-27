@@ -530,3 +530,29 @@ def get_bundle(product_id: int, k: int = 10):
         "ids":        similar_ids(product_id, k),
         "source":     "similarity_fallback"
     }
+
+
+
+
+# ─────────────────────────────────────────────
+#  RAILWAY COMPATIBLE STARTUP 
+# ─────────────────────────────────────────────
+
+import os
+
+if __name__ == "__main__":
+    import uvicorn
+    
+    port = int(os.environ.get("PORT", 8000))
+    host = os.environ.get("HOST", "0.0.0.0")
+    
+    logger.info(f"🚀 Starting Tasleem AI Service on {host}:{port}")
+    
+    uvicorn.run(
+        "main:app",
+        host=host,
+        port=port,
+        log_level="info",
+        access_log=True,
+    )
+
