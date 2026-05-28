@@ -6,3 +6,4 @@ faiss-cpu
 sentence-transformers
 scikit-learn
 rapidfuzz
+python-dotenv 
