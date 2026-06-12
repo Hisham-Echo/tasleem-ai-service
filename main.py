@@ -138,13 +138,16 @@ async def lifespan(app: FastAPI):
 
     build_search_vocabulary()
 
-    # Pull the LIVE catalog so new listings work without a retrain. Failure is
-    # non-fatal — the service keeps running on the snapshot.
-    try:
-        synced = sync_live_catalog()
-        logger.info(f"✓ Live sync at startup: {synced} products from backend")
-    except Exception as e:
-        logger.error(f"✗ Live sync failed (continuing with snapshot): {e}")
+    # Pull the LIVE catalog in the BACKGROUND so startup stays fast (the
+    # server binds immediately and serves the snapshot until the sync lands).
+    # New listings work without a retrain; failure is non-fatal.
+    def _initial_sync():
+        try:
+            synced = sync_live_catalog()
+            logger.info(f"✓ Live sync after startup: {synced} products from backend")
+        except Exception as e:
+            logger.error(f"✗ Live sync failed (continuing with snapshot): {e}")
+    threading.Thread(target=_initial_sync, daemon=True).start()
 
     # Periodic background re-sync.
     if SYNC_INTERVAL_HOURS > 0:
@@ -252,6 +255,19 @@ def _get_product(products, product_id):
         rows = products[products["id"] == product_id]
         return rows.iloc[0].to_dict() if len(rows) else None
     return products.get(product_id)
+
+
+def _is_sold_out(p) -> bool:
+    """Matches the app's availability rule: unavailable status OR no stock.
+    (Catches sold-out items even when the backend hasn't flipped status.)"""
+    if p is None:
+        return False
+    if str(p.get("status", "1")) == "0":
+        return True
+    try:
+        return "quantity" in p and int(p.get("quantity") or 0) <= 0
+    except (TypeError, ValueError):
+        return False
 
 
 def fetch_live_products(max_pages: int = 100) -> dict:
@@ -415,9 +431,8 @@ def tfidf_similar(product_id: int, k: int = 10) -> list:
             pid = t_ids[i]
             if pid == product_id:
                 continue
-            cand = _get_product(products, pid)
-            if cand is not None and str(cand.get("status", "1")) == "0":
-                continue  # skip sold-out
+            if _is_sold_out(_get_product(products, pid)):
+                continue
             out.append(pid)
         return out
     except Exception as e:
@@ -562,7 +577,7 @@ def full_search(query: str, k: int = 10) -> list:
         p = _get_product(products, pid)
         if p is None:
             return base
-        if str(p.get("status", "1")) == "0":
+        if _is_sold_out(p):
             return -1.0  # sold out → exclude from results
         boost = 1.0
         boost += min(float(p.get("rate") or 0) / 25.0, 0.2)        # ≤ +20%
@@ -593,6 +608,7 @@ def health():
         "status": "online",
         "products_loaded": len(products) if products is not None else 0,
         "live_synced": ml_models.get("live_sync_count", 0),
+        "refresh_in_progress": bool(ml_models.get("refresh_in_progress", False)),
         "sentiment_summary": ml_models.get("sentiment_summary") is not None,
         "tfidf_ready": ml_models.get("tfidf_vectorizer") is not None,
         "vocab_size": len(ml_models.get("search_vocab", [])),
@@ -602,15 +618,31 @@ def health():
 @app.post("/refresh")
 def refresh(token: str = ""):
     """Re-sync the live catalog from the backend on demand (e.g. after a burst
-    of new listings) — no redeploy needed. Protect with REFRESH_TOKEN env var."""
+    of new listings) — no redeploy needed. Protect with REFRESH_TOKEN env var.
+
+    Runs in the background and returns immediately; watch /health
+    (live_synced / refresh_in_progress) to see it complete."""
     if REFRESH_TOKEN and token != REFRESH_TOKEN:
         return {"success": False, "message": "invalid token"}
-    synced = sync_live_catalog()
+    if ml_models.get("refresh_in_progress"):
+        return {"success": True, "message": "refresh already in progress"}
+
+    ml_models["refresh_in_progress"] = True
+
+    def _run():
+        try:
+            sync_live_catalog()
+        except Exception as e:
+            logger.error(f"On-demand refresh failed: {e}")
+        finally:
+            ml_models["refresh_in_progress"] = False
+
+    threading.Thread(target=_run, daemon=True).start()
     products = ml_models.get("products")
     return {
-        "success": synced > 0,
-        "live_products": synced,
-        "total_products": len(products) if products is not None else 0,
+        "success": True,
+        "message": "refresh started",
+        "current_products": len(products) if products is not None else 0,
     }
 
 
