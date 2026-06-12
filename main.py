@@ -1,7 +1,11 @@
+import os
 import re
+import time
 import pickle
 import logging
+import threading
 import faiss
+import requests
 import numpy as np
 from dotenv import load_dotenv
 from fastapi import FastAPI, Query
@@ -16,6 +20,17 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 load_dotenv()
+
+# Live backend (Laravel API). Lets the AI serve products created AFTER the
+# offline models were trained (new listings become searchable + similar-able).
+BACKEND_URL = os.environ.get(
+    "BACKEND_URL",
+    "https://tasleembackendapi-production.up.railway.app/api/v1",
+).rstrip("/")
+# Optional token protecting POST /refresh (open when unset).
+REFRESH_TOKEN = os.environ.get("REFRESH_TOKEN", "")
+# Re-sync the live catalog every N hours in the background (0 disables).
+SYNC_INTERVAL_HOURS = float(os.environ.get("SYNC_INTERVAL_HOURS", "6"))
 
 ml_models = {}
 
@@ -44,6 +59,37 @@ ELECTRONICS_SYNONYMS = {
     "apple":    ["iphone", "ipad", "macbook", "airpods"],
     "samsung":  ["galaxy", "samsung phone", "samsung tv"],
     "sony":     ["playstation", "sony camera", "sony headphone"],
+    "airpods":  ["earbuds", "wireless earphone", "apple"],
+    "ps5":      ["playstation 5", "console"],
+    "ps4":      ["playstation 4", "console"],
+    "xbox":     ["console", "series x", "series s"],
+    "macbook":  ["laptop", "apple"],
+    "ssd":      ["storage", "solid state", "hard drive"],
+    "hdd":      ["hard drive", "storage"],
+    "powerbank":["power bank", "charger", "battery"],
+
+    # Arabic → English (what users actually type)
+    "موبايل":     ["mobile", "phone", "smartphone"],
+    "موبيل":      ["mobile", "phone", "smartphone"],
+    "تليفون":     ["phone", "smartphone"],
+    "هاتف":       ["phone", "smartphone"],
+    "لابتوب":     ["laptop", "notebook"],
+    "لاب توب":    ["laptop", "notebook"],
+    "كمبيوتر":    ["computer", "desktop", "pc"],
+    "سماعة":      ["headphones", "earbuds", "speaker"],
+    "سماعات":     ["headphones", "earbuds", "speakers"],
+    "شاشة":       ["monitor", "screen", "tv"],
+    "تلفزيون":    ["tv", "television"],
+    "كاميرا":     ["camera"],
+    "ساعة":       ["watch", "smartwatch"],
+    "شاحن":       ["charger", "power bank"],
+    "تابلت":      ["tablet", "ipad"],
+    "ايفون":      ["iphone", "apple"],
+    "ايباد":      ["ipad", "tablet"],
+    "بلايستيشن":  ["playstation", "console"],
+    "راوتر":      ["router", "wifi"],
+    "برنتر":      ["printer"],
+    "طابعة":      ["printer"],
 }
 
 
@@ -92,6 +138,25 @@ async def lifespan(app: FastAPI):
 
     build_search_vocabulary()
 
+    # Pull the LIVE catalog so new listings work without a retrain. Failure is
+    # non-fatal — the service keeps running on the snapshot.
+    try:
+        synced = sync_live_catalog()
+        logger.info(f"✓ Live sync at startup: {synced} products from backend")
+    except Exception as e:
+        logger.error(f"✗ Live sync failed (continuing with snapshot): {e}")
+
+    # Periodic background re-sync.
+    if SYNC_INTERVAL_HOURS > 0:
+        def _periodic_sync():
+            while True:
+                time.sleep(SYNC_INTERVAL_HOURS * 3600)
+                try:
+                    sync_live_catalog()
+                except Exception as e:
+                    logger.error(f"Periodic live sync failed: {e}")
+        threading.Thread(target=_periodic_sync, daemon=True).start()
+
     logger.info("All models loaded. Server is ready.")
     yield
     ml_models.clear()
@@ -130,8 +195,9 @@ def build_tfidf_from_products():
     ids, texts = [], []
     for pid, product in items:
         ids.append(pid)
+        name = str(product.get("name", ""))
         text = " ".join(filter(None, [
-            str(product.get("name", "")),
+            name, name, name,  # weight the product NAME 3× vs description
             str(product.get("description", "")),
             str(product.get("category", "")),
             str(product.get("brand", "")),
@@ -171,6 +237,81 @@ def build_search_vocabulary():
 
     ml_models["search_vocab"] = list(vocab)
     logger.info(f"✓ Search vocabulary built: {len(vocab)} words")
+
+
+# ─────────────────────────────────────────────
+# LIVE CATALOG SYNC — pull current products from the Laravel backend so
+# newly listed items are searchable / similar-able without retraining.
+# ─────────────────────────────────────────────
+
+def _get_product(products, product_id):
+    """Uniform product lookup for both dict and DataFrame catalogs."""
+    if products is None:
+        return None
+    if hasattr(products, "iterrows"):
+        rows = products[products["id"] == product_id]
+        return rows.iloc[0].to_dict() if len(rows) else None
+    return products.get(product_id)
+
+
+def fetch_live_products(max_pages: int = 100) -> dict:
+    """Fetch the full live catalog (paginated). Returns {id: {...}} or {}."""
+    out, page = {}, 1
+    while page <= max_pages:
+        try:
+            r = requests.get(
+                f"{BACKEND_URL}/products",
+                params={"per_page": 100, "page": page},
+                timeout=30,
+            )
+            body = r.json()
+        except Exception as e:
+            logger.error(f"Live fetch failed on page {page}: {e}")
+            break
+        for p in body.get("data") or []:
+            pid = p.get("id")
+            if pid is None:
+                continue
+            out[pid] = {
+                "id": pid,
+                "name": p.get("name") or "",
+                "description": p.get("description") or "",
+                "category": ((p.get("category") or {}).get("name")) or "",
+                "brand": "",
+                "status": str(p.get("status", "1")),
+                "quantity": p.get("quantity") or 0,
+                "rate": float(p.get("rate") or 0),
+                "view_count": p.get("view_count") or 0,
+            }
+        pag = body.get("pagination") or {}
+        if page >= (pag.get("last_page") or page):
+            break
+        page += 1
+    logger.info(f"Live catalog fetched: {len(out)} products from {BACKEND_URL}")
+    return out
+
+
+def sync_live_catalog() -> int:
+    """Merge live products into ml_models['products'] (normalising a snapshot
+    DataFrame to a dict) and rebuild the TF-IDF index + search vocabulary."""
+    live = fetch_live_products()
+    if not live:
+        return 0
+    merged = {}
+    snapshot = ml_models.get("products")
+    if snapshot is not None:
+        if hasattr(snapshot, "iterrows"):
+            for _, row in snapshot.iterrows():
+                merged[row["id"]] = dict(row)
+        else:
+            merged.update(snapshot)
+    merged.update(live)  # live data wins on conflicts
+    ml_models["products"] = merged
+    ml_models["live_sync_count"] = len(live)
+    build_tfidf_from_products()
+    build_search_vocabulary()
+    logger.info(f"✓ Live sync complete: catalog now {len(merged)} products")
+    return len(live)
 
 
 # ─────────────────────────────────────────────
@@ -248,6 +389,42 @@ def search_ids(q: str, k: int = 10) -> list:
 # LAYER 3 — FAISS SIMILARITY EXPANSION
 # ─────────────────────────────────────────────
 
+def tfidf_similar(product_id: int, k: int = 10) -> list:
+    """Content-based similar products via TF-IDF cosine similarity.
+    Covers products that are NOT in the FAISS index (e.g. newly listed):
+    works for anything present in the (live-synced) catalog."""
+    try:
+        products   = ml_models.get("products")
+        vectorizer = ml_models.get("tfidf_vectorizer")
+        matrix     = ml_models.get("tfidf_matrix")
+        t_ids      = ml_models.get("tfidf_ids")
+        p = _get_product(products, product_id)
+        if p is None or vectorizer is None or matrix is None:
+            return []
+        text = " ".join(filter(None, [
+            str(p.get("name", "")),
+            str(p.get("description", "")),
+            str(p.get("category", "")),
+        ])).lower()
+        q_vec  = vectorizer.transform([text])
+        scores = cosine_similarity(q_vec, matrix).flatten()
+        out = []
+        for i in scores.argsort()[::-1]:
+            if scores[i] <= 0 or len(out) >= k:
+                break
+            pid = t_ids[i]
+            if pid == product_id:
+                continue
+            cand = _get_product(products, pid)
+            if cand is not None and str(cand.get("status", "1")) == "0":
+                continue  # skip sold-out
+            out.append(pid)
+        return out
+    except Exception as e:
+        logger.error(f"Error in tfidf_similar: {e}")
+        return []
+
+
 def similar_ids(product_id: int, k: int = 10) -> list:
     """Find similar products using FAISS vector index."""
     try:
@@ -256,7 +433,8 @@ def similar_ids(product_id: int, k: int = 10) -> list:
         id_m    = ml_models.get("id_map")
 
         if not rev_map or product_id not in rev_map or idx is None:
-            return []
+            # Not in the trained index (e.g. newly listed) → content similarity.
+            return tfidf_similar(product_id, k)
 
         vec = idx.reconstruct(rev_map[product_id]).reshape(1, -1)
         _, I = idx.search(vec, k + 1)
@@ -377,7 +555,23 @@ def full_search(query: str, k: int = 10) -> list:
                     scores[pid] = max(scores.get(pid, 0), 0.1 / (i + 1))
                 break
 
-    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    # ── Re-rank: drop sold-out items, lightly boost well-rated/viewed ones ──
+    products = ml_models.get("products")
+
+    def _final_score(pid, base):
+        p = _get_product(products, pid)
+        if p is None:
+            return base
+        if str(p.get("status", "1")) == "0":
+            return -1.0  # sold out → exclude from results
+        boost = 1.0
+        boost += min(float(p.get("rate") or 0) / 25.0, 0.2)        # ≤ +20%
+        boost += min(float(p.get("view_count") or 0) / 5000.0, 0.1)  # ≤ +10%
+        return base * boost
+
+    rescored = ((pid, _final_score(pid, s)) for pid, s in scores.items())
+    ranked = sorted((x for x in rescored if x[1] >= 0),
+                    key=lambda x: x[1], reverse=True)
     result = [pid for pid, _ in ranked[:k]]
 
     logger.info(f"Search '{query}' → {len(result)} results")
@@ -398,9 +592,25 @@ def health():
     return {
         "status": "online",
         "products_loaded": len(products) if products is not None else 0,
+        "live_synced": ml_models.get("live_sync_count", 0),
         "sentiment_summary": ml_models.get("sentiment_summary") is not None,
         "tfidf_ready": ml_models.get("tfidf_vectorizer") is not None,
         "vocab_size": len(ml_models.get("search_vocab", [])),
+    }
+
+
+@app.post("/refresh")
+def refresh(token: str = ""):
+    """Re-sync the live catalog from the backend on demand (e.g. after a burst
+    of new listings) — no redeploy needed. Protect with REFRESH_TOKEN env var."""
+    if REFRESH_TOKEN and token != REFRESH_TOKEN:
+        return {"success": False, "message": "invalid token"}
+    synced = sync_live_catalog()
+    products = ml_models.get("products")
+    return {
+        "success": synced > 0,
+        "live_products": synced,
+        "total_products": len(products) if products is not None else 0,
     }
 
 
