@@ -31,8 +31,14 @@ BACKEND_URL = os.environ.get(
 REFRESH_TOKEN = os.environ.get("REFRESH_TOKEN", "")
 # Re-sync the live catalog every N hours in the background (0 disables).
 SYNC_INTERVAL_HOURS = float(os.environ.get("SYNC_INTERVAL_HOURS", "6"))
+# How long (seconds) a live-classified sentiment summary stays cached per product.
+SENTIMENT_TTL = float(os.environ.get("SENTIMENT_TTL_SECONDS", "3600"))
 
 ml_models = {}
+
+# product_id -> (timestamp, summary_dict) for live sentiment results.
+_sentiment_cache = {}
+_sentiment_lock = threading.Lock()
 
 
 # ============================================================
@@ -130,6 +136,9 @@ async def lifespan(app: FastAPI):
         ml_models["tfidf_ids"]        = None
 
     safe_load("sentiment_summary", lambda: pickle.load(open("sentiment_summary_last_v2.pkl", "rb")))
+    # Trained sentiment classifier (sklearn Pipeline: raw text -> positive/neutral/negative).
+    # Enables LIVE classification of new comments; falls back to the baked summary if absent.
+    safe_load("sentiment_model",   lambda: pickle.load(open("sentiment_model_last_v2.pkl", "rb")))
     safe_load("bundles",           lambda: pickle.load(open("bundles.pkl", "rb")))
 
     if ml_models.get("tfidf_vectorizer") is None:
@@ -328,6 +337,76 @@ def sync_live_catalog() -> int:
     build_search_vocabulary()
     logger.info(f"✓ Live sync complete: catalog now {len(merged)} products")
     return len(live)
+
+
+def fetch_live_reviews(product_id: int, max_pages: int = 50) -> list:
+    """Fetch all comment strings for a product from the backend (paginated)."""
+    out, page = [], 1
+    while page <= max_pages:
+        try:
+            r = requests.get(
+                f"{BACKEND_URL}/reviews",
+                params={"product_id": product_id, "per_page": 100, "page": page},
+                timeout=20,
+            )
+            body = r.json()
+        except Exception as e:
+            logger.error(f"Live reviews fetch failed for {product_id} p{page}: {e}")
+            break
+        for rv in body.get("data") or []:
+            comment = (rv.get("comment") or "").strip()
+            if comment:
+                out.append(comment)
+        pag = body.get("pagination") or {}
+        if page >= (pag.get("last_page") or page):
+            break
+        page += 1
+    return out
+
+
+def classify_reviews_live(product_id: int):
+    """Run the trained sentiment model over the product's live comments and
+    build a summary in the EXACT shape of the baked summaries (so the app needs
+    no changes). Returns None if the model is missing or there are no comments."""
+    model = ml_models.get("sentiment_model")
+    if model is None:
+        return None
+    comments = fetch_live_reviews(product_id)
+    if not comments:
+        return None
+    try:
+        labels = [str(x) for x in model.predict(comments)]
+        confs = [float(max(row)) for row in model.predict_proba(comments)]
+    except Exception as e:
+        logger.error(f"Sentiment classify failed for {product_id}: {e}")
+        return None
+
+    total = len(comments)
+    counts = {"positive": 0, "neutral": 0, "negative": 0}
+    samples = {"positive": [], "negative": [], "neutral": []}
+    for comment, label, _conf in zip(comments, labels, confs):
+        if label not in counts:
+            continue
+        counts[label] += 1
+        if len(samples[label]) < 3:
+            samples[label].append(comment)
+
+    pct = lambda n: round(n * 100.0 / total, 1) if total else 0
+    overall = max(counts, key=counts.get) if total else "unknown"
+    return {
+        "product_id":     product_id,
+        "total_reviews":  total,
+        "positive":       counts["positive"],
+        "neutral":        counts["neutral"],
+        "negative":       counts["negative"],
+        "positive_pct":   pct(counts["positive"]),
+        "negative_pct":   pct(counts["negative"]),
+        "neutral_pct":    pct(counts["neutral"]),
+        "overall":        overall,
+        "avg_confidence": round(sum(confs) / len(confs), 3) if confs else 0,
+        "sample_reviews": samples,
+        "source":         "live",
+    }
 
 
 # ─────────────────────────────────────────────
@@ -610,6 +689,7 @@ def health():
         "live_synced": ml_models.get("live_sync_count", 0),
         "refresh_in_progress": bool(ml_models.get("refresh_in_progress", False)),
         "sentiment_summary": ml_models.get("sentiment_summary") is not None,
+        "sentiment_model_live": ml_models.get("sentiment_model") is not None,
         "tfidf_ready": ml_models.get("tfidf_vectorizer") is not None,
         "vocab_size": len(ml_models.get("search_vocab", [])),
     }
@@ -733,7 +813,24 @@ async def debug():
 # ─────────────────────────────────────────────
 
 @app.get("/reviews/summary/{product_id}")
-def product_sentiment_summary(product_id: int):
+def product_sentiment_summary(product_id: int, live: bool = True):
+    # 1. Fresh live result in cache → return it.
+    if live:
+        with _sentiment_lock:
+            cached = _sentiment_cache.get(product_id)
+        if cached and (time.time() - cached[0]) < SENTIMENT_TTL:
+            return cached[1]
+
+    # 2. Classify the product's CURRENT comments with the trained model.
+    #    Covers new products and new comments on old products.
+    if live and ml_models.get("sentiment_model") is not None:
+        live_result = classify_reviews_live(product_id)
+        if live_result:
+            with _sentiment_lock:
+                _sentiment_cache[product_id] = (time.time(), live_result)
+            return live_result
+
+    # 3. Fall back to the baked snapshot summary.
     summary = ml_models.get("sentiment_summary") or {}
     result  = summary.get(product_id) or summary.get(str(product_id))
 
