@@ -1,5 +1,7 @@
 import os
+import io
 import re
+import json
 import time
 import pickle
 import logging
@@ -8,12 +10,25 @@ import faiss
 import requests
 import numpy as np
 from dotenv import load_dotenv
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import TfidfVectorizer
 from contextlib import asynccontextmanager
 from rapidfuzz import process, fuzz
+
+# TFLite runtime for the electronic-image detector (lightweight LiteRT; falls
+# back to tflite_runtime or full TensorFlow if LiteRT isn't present).
+try:
+    from ai_edge_litert.interpreter import Interpreter as TFLiteInterpreter
+except Exception:
+    try:
+        from tflite_runtime.interpreter import Interpreter as TFLiteInterpreter
+    except Exception:
+        try:
+            from tensorflow.lite import Interpreter as TFLiteInterpreter
+        except Exception:
+            TFLiteInterpreter = None
 
 
 logging.basicConfig(level=logging.INFO)
@@ -39,6 +54,11 @@ ml_models = {}
 # product_id -> (timestamp, summary_dict) for live sentiment results.
 _sentiment_cache = {}
 _sentiment_lock = threading.Lock()
+
+# TFLite Interpreter is NOT thread-safe — serialise inference calls.
+_electronic_lock = threading.Lock()
+ELECTRONIC_MODEL_PATH = os.environ.get("ELECTRONIC_MODEL_PATH", "electronic_detector.tflite")
+ELECTRONIC_LABELS_PATH = os.environ.get("ELECTRONIC_LABELS_PATH", "labels.json")
 
 
 # ============================================================
@@ -140,6 +160,22 @@ async def lifespan(app: FastAPI):
     # Enables LIVE classification of new comments; falls back to the baked summary if absent.
     safe_load("sentiment_model",   lambda: pickle.load(open("sentiment_model_last_v2.pkl", "rb")))
     safe_load("bundles",           lambda: pickle.load(open("bundles.pkl", "rb")))
+
+    # Electronic-image detector (TFLite) — used by POST /detect/electronic to
+    # block non-electronic product photos at listing time.
+    try:
+        if TFLiteInterpreter is None:
+            raise RuntimeError("no TFLite runtime installed")
+        labels = json.load(open(ELECTRONIC_LABELS_PATH, "r", encoding="utf-8"))
+        interp = TFLiteInterpreter(model_path=ELECTRONIC_MODEL_PATH)
+        interp.allocate_tensors()
+        ml_models["electronic_interp"] = interp
+        ml_models["electronic_labels"] = labels
+        logger.info(f"✓ Loaded: electronic_detector ({len(labels.get('classes', []))} classes)")
+    except Exception as e:
+        logger.error(f"✗ Failed to load electronic_detector: {e}")
+        ml_models["electronic_interp"] = None
+        ml_models["electronic_labels"] = None
 
     if ml_models.get("tfidf_vectorizer") is None:
         logger.warning("TF-IDF not loaded from file — building from products...")
@@ -680,6 +716,78 @@ semantic_search = full_search
 # ENDPOINTS
 # ─────────────────────────────────────────────
 
+# ─────────────────────────────────────────────
+# ELECTRONIC IMAGE DETECTOR  (listing-photo gate)
+# ─────────────────────────────────────────────
+
+def classify_electronic_image(image_bytes: bytes) -> dict:
+    """Run the TFLite classifier on an uploaded photo and decide whether it's an
+    electronic product. Fails OPEN (accept=True) when the model is unavailable so
+    a model outage never blocks legitimate sellers."""
+    interp = ml_models.get("electronic_interp")
+    labels = ml_models.get("electronic_labels")
+    if interp is None or labels is None:
+        return {"accept": True, "is_electronic": True, "model_available": False,
+                "label": None, "category": None, "confidence": 0.0,
+                "message": "Image check is unavailable right now."}
+
+    from PIL import Image
+    size = int(labels.get("img_size", 224))
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB").resize((size, size))
+    arr = np.asarray(img, dtype=np.float32)[None, ...]  # [1,H,W,3] in [0,255]
+
+    with _electronic_lock:
+        inp = interp.get_input_details()[0]
+        out = interp.get_output_details()[0]
+        x = arr.astype(inp["dtype"]) if inp["dtype"] != np.float32 else arr
+        interp.set_tensor(inp["index"], x)
+        interp.invoke()
+        probs = interp.get_tensor(out["index"])[0].astype(float)
+
+    idx = int(np.argmax(probs))
+    conf = float(probs[idx])
+    classes = labels.get("classes", [])
+    label = classes[idx] if idx < len(classes) else "unknown"
+    neg = labels.get("negative_label", "non_electronic")
+    thr = float(labels.get("confidence_threshold", 0.45))
+    is_electronic = (label != neg) and (conf >= thr)
+    category = label.replace("_", " ")
+    message = (f"Looks like {category} — photo accepted."
+               if is_electronic else
+               "We only accept electronics. This photo doesn't look like an electronic "
+               "product — please upload a clear photo of the item you're selling.")
+    return {
+        "accept": is_electronic,
+        "is_electronic": is_electronic,
+        "model_available": True,
+        "label": label,
+        "category": category if is_electronic else None,
+        "confidence": round(conf, 4),
+        "message": message,
+    }
+
+
+@app.post("/detect/electronic")
+async def detect_electronic(file: UploadFile = File(...)):
+    """Classify an uploaded product photo — is it an electronic item?
+    Used by the app at listing time to reject non-electronic photos."""
+    try:
+        data = await file.read()
+    except Exception as e:
+        return {"accept": True, "is_electronic": True, "model_available": False,
+                "message": "Could not read the image.", "error": str(e)}
+    if not data:
+        return {"accept": True, "is_electronic": True, "model_available": False,
+                "message": "Empty image."}
+    try:
+        return classify_electronic_image(data)
+    except Exception as e:
+        logger.error(f"detect_electronic failed: {e}")
+        # Fail OPEN so a model error never blocks a legit listing.
+        return {"accept": True, "is_electronic": True, "model_available": False,
+                "message": "Image check failed; allowing upload.", "error": str(e)}
+
+
 @app.get("/health")
 def health():
     products = ml_models.get("products")
@@ -692,6 +800,7 @@ def health():
         "sentiment_model_live": ml_models.get("sentiment_model") is not None,
         "tfidf_ready": ml_models.get("tfidf_vectorizer") is not None,
         "vocab_size": len(ml_models.get("search_vocab", [])),
+        "electronic_detector": ml_models.get("electronic_interp") is not None,
     }
 
 
