@@ -1,0 +1,28 @@
+{
+  "classes": [
+    "Cables",
+    "Cameras",
+    "Chargers",
+    "Desktops",
+    "Gaming_Consoles",
+    "Headphones",
+    "Laptops",
+    "Memory_Cards",
+    "Monitors",
+    "Networking_Devices",
+    "Power_Banks",
+    "Printers",
+    "Projectors",
+    "Scanners",
+    "Smart_Watches",
+    "Smartphones",
+    "Speakers",
+    "Storage_Devices",
+    "Tablets",
+    "Televisions",
+    "non_electronic"
+  ],
+  "negative_label": "non_electronic",
+  "confidence_threshold": 0.45,
+  "img_size": 224
+}
